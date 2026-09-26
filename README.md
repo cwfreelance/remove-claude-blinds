@@ -194,21 +194,94 @@ Each repo gets its own `context-meter.conf`, so thresholds and messages can diff
 
 ## Testing it
 
-To check it without filling a real context window, point it at a fake transcript:
+You can check the hook without filling a real context window by pointing it at a fake transcript.
+
+### What a transcript is
+
+Claude Code records every session as a JSONL file (one JSON object per line):
+
+- **Main session:** `~/.claude/projects/<project-folder>/<session-id>.jsonl` (`%USERPROFILE%\.claude\projects\...` on Windows). `<project-folder>` is the project's path with separators replaced by `-`, e.g. `-Users-you-projects-myapp`.
+- **Subagents:** `~/.claude/projects/<project-folder>/<session-id>/subagents/agent-<agent-id>.jsonl`
+
+The hook only reads one thing from a transcript: the `message.usage` block of the most recent assistant turn. So a fake transcript can be a single line:
+
+```json
+{"type":"assistant","message":{"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":190000}}}
+```
+
+The three numbers add up to the context size. Change `190000` to test each tier: below `WARN` gives no output, between `WARN` and `HANDOFF` gives the warning, and `HANDOFF` or above gives a handoff message.
+
+When Claude Code runs the hook, it sends a JSON object on stdin that includes `transcript_path`, plus `agent_id` and `agent_type` when the tool call came from a subagent. The tests below send that input by hand.
+
+### 1. Main session
+
+macOS / Linux:
 
 ```sh
-echo '{"message":{"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":190000}}}' > /tmp/fake.jsonl
-echo '{"transcript_path":"/tmp/fake.jsonl"}' | ~/.claude/hooks/context-meter.sh
+mkdir -p /tmp/cm-test
+echo '{"type":"assistant","message":{"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":190000}}}' > /tmp/cm-test/session.jsonl
+echo '{"transcript_path":"/tmp/cm-test/session.jsonl"}' | ~/.claude/hooks/context-meter.sh
 ```
 
-On Windows (PowerShell):
+Windows (PowerShell):
 
 ```powershell
-'{"type":"assistant","message":{"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":190000}}}' | Set-Content "$env:TEMP\fake.jsonl"
-(@{ transcript_path = "$env:TEMP\fake.jsonl" } | ConvertTo-Json) | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude\hooks\context-meter.ps1"
+$d = "$env:TEMP\cm-test"
+$hook = "$env:USERPROFILE\.claude\hooks\context-meter.ps1"
+New-Item -ItemType Directory -Force "$d\session\subagents" | Out-Null
+'{"type":"assistant","message":{"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":190000}}}' | Set-Content "$d\session.jsonl"
+(@{ transcript_path = "$d\session.jsonl" } | ConvertTo-Json) | powershell.exe -NoProfile -ExecutionPolicy Bypass -File $hook
 ```
 
-Either way, you should get a JSON object containing the main-session handoff message. For a live test, temporarily lower `WARN`/`HANDOFF` to something like `20000`/`25000` and give an agent a multi-step task.
+Expected: a JSON object whose `additionalContext` starts with `[context-meter: ...]` and contains `CONTEXT LIMIT: you are at 190k tokens`.
+
+### 2. Subagent
+
+A subagent's transcript sits in a folder named after the session file (without `.jsonl`), so create that layout next to the fake session:
+
+macOS / Linux:
+
+```sh
+mkdir -p /tmp/cm-test/session/subagents
+echo '{"type":"assistant","message":{"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":185000}}}' > /tmp/cm-test/session/subagents/agent-test1.jsonl
+echo '{"transcript_path":"/tmp/cm-test/session.jsonl","agent_id":"test1","agent_type":"fixer"}' | ~/.claude/hooks/context-meter.sh
+```
+
+Windows (PowerShell, continuing from step 1):
+
+```powershell
+'{"type":"assistant","message":{"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":185000}}}' | Set-Content "$d\session\subagents\agent-test1.jsonl"
+(@{ transcript_path = "$d\session.jsonl"; agent_id = "test1"; agent_type = "fixer" } | ConvertTo-Json) | powershell.exe -NoProfile -ExecutionPolicy Bypass -File $hook
+```
+
+Expected: `CONTEXT LIMIT: you (fixer subagent) are at 185k tokens`. That confirms the hook reads the subagent's own transcript (185k), not the parent's (190k).
+
+### 3. A real session
+
+To see what the hook sees in one of your real sessions, point it at your most recently active transcript. It prints nothing if that session is below `WARN`, so the second command prints the raw context size either way.
+
+macOS / Linux:
+
+```sh
+t=$(ls -t ~/.claude/projects/*/*.jsonl | head -1)
+echo "{\"transcript_path\":\"$t\"}" | ~/.claude/hooks/context-meter.sh
+grep '"cache_read_input_tokens"' "$t" | tail -1 | jq '.message.usage | .input_tokens + .cache_creation_input_tokens + .cache_read_input_tokens'
+```
+
+Windows (PowerShell):
+
+```powershell
+$t = (Get-ChildItem "$env:USERPROFILE\.claude\projects\*\*.jsonl" | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+(@{ transcript_path = $t } | ConvertTo-Json) | powershell.exe -NoProfile -ExecutionPolicy Bypass -File $hook
+$u = ((Select-String -LiteralPath $t -Pattern '"cache_read_input_tokens"' -SimpleMatch | Select-Object -Last 1).Line | ConvertFrom-Json).message.usage
+$u.input_tokens + $u.cache_creation_input_tokens + $u.cache_read_input_tokens
+```
+
+If you run this from inside a Claude Code session, the most recent transcript is that session's own, so the number should roughly match `/context`.
+
+### 4. Live
+
+For an end-to-end check, temporarily lower `WARN`/`HANDOFF` to something like `20000`/`25000`. A fresh session already uses about 20k tokens for the system prompt and tools, so the handoff triggers after a few tool calls. Give an agent (or a subagent) a multi-step task and confirm it stops and writes a handoff. Put the thresholds back afterward.
 
 ## How it works
 
