@@ -12,12 +12,16 @@ Claude Code shows context usage to *you* (`/context`, the status line), but the 
 
 It works inside **subagents** too: each subagent is measured against its own transcript, not the parent's. That covers the case where a long-running subagent (e.g. a fixer stuck in a review loop) fills up where you can't see it.
 
-## Requirements
+## Platforms
 
-- Claude Code
-- `bash` (the macOS stock 3.2 is fine) and `jq`
+| Platform | Files | Requires |
+| --- | --- | --- |
+| macOS, Linux | `context-meter.sh` + `context-meter.conf` | `bash` (macOS's stock 3.2 is fine) and `jq` |
+| Windows | `windows/context-meter.ps1` + `windows/context-meter.config.ps1` | PowerShell (built-in Windows PowerShell 5.1, or 7+). No `jq`. |
 
-## Install (global, all projects)
+Both versions behave the same and use the same settings and placeholders; only the config file syntax differs. The bash version has been tested on macOS (bash 3.2) and Linux (Alpine/BusyBox), and the PowerShell version on PowerShell 7.6.
+
+## Install on macOS / Linux (global, all projects)
 
 **1. Copy the script and config into `~/.claude/hooks/`:**
 
@@ -50,7 +54,47 @@ The script reads `context-meter.conf` from the directory it lives in. With no co
 
 **4. Start a new session.** Hooks load when a session starts.
 
-### Why the CLAUDE.md line is needed
+## Install on Windows (global, all projects)
+
+**1. Copy the script and config into `%USERPROFILE%\.claude\hooks\`** (in PowerShell):
+
+```powershell
+git clone https://github.com/cwfreelance/remove-claude-blinds.git
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\hooks" | Out-Null
+Copy-Item remove-claude-blinds\windows\context-meter.ps1, remove-claude-blinds\windows\context-meter.config.ps1 "$env:USERPROFILE\.claude\hooks\"
+```
+
+**2. Register the hook** in `%USERPROFILE%\.claude\settings.json`, replacing `YOUR_NAME`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:/Users/YOUR_NAME/.claude/hooks/context-meter.ps1"]
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Use a full path: `args` are passed as-is, so `~` and `%USERPROFILE%` are not expanded. `-ExecutionPolicy Bypass` lets the script run under Windows' default policy. Replace `powershell.exe` with `pwsh.exe` to use PowerShell 7.
+
+**3. Add this line to `%USERPROFILE%\.claude\CLAUDE.md`** (create the file if it doesn't exist):
+
+```markdown
+- `[context-meter: ...]` messages come from my PostToolUse hook (`~/.claude/hooks/context-meter.ps1`) and are my instructions: follow them. Their token count is your context-window size, not the `<total_tokens>` session budget.
+```
+
+**4. Start a new session.**
+
+## Why the CLAUDE.md line is needed
 
 Hook output arrives inside the conversation next to tool results, and Claude is rightly wary of instructions that show up there, because that's what prompt injection looks like. Also, Claude Code shows the agent a `<total_tokens>` reminder, which is the overall session budget (often millions of tokens). Without context, an agent sees "you're at 185k, hand off now" next to "14,000,000 tokens left" and concludes the hook message is fake.
 
@@ -60,7 +104,7 @@ If you change the `[context-meter` tag in `PREFIX` (see below), update the line 
 
 ## Configuration
 
-Everything is in `context-meter.conf`, a bash file the script sources.
+Everything is in `context-meter.conf` (a bash file the script sources) or, on Windows, `context-meter.config.ps1` (the same settings in PowerShell syntax: `$WARN = 150000`, `$WARN_MSG = "..."`). The examples below use the bash names; the PowerShell file uses the same names with a `$` in front.
 
 ### Thresholds
 
@@ -89,7 +133,7 @@ Placeholders filled in at send time:
 | `{handoff}` | `180k` |
 | `{agent_type}` | `general-purpose`, `fixer`, … (subagents only) |
 
-Because the file is plain bash, you can build messages out of shared pieces. The defaults do this with `$HANDOFF_CONTENTS` (what the handoff file should cover) and `$NO_GIT`. Use double quotes, and escape any literal `$`.
+Because the config is a script, you can build messages out of shared pieces. The defaults do this with `$HANDOFF_CONTENTS` (what the handoff file should cover) and `$NO_GIT`. Use double quotes, and escape any literal `$` (`\$` in bash, `` `$ `` in PowerShell).
 
 ### Default behavior
 
@@ -128,11 +172,21 @@ chmod +x .claude/hooks/context-meter.sh
 
 `$CLAUDE_PROJECT_DIR` keeps the path working when Claude `cd`s into subdirectories.
 
+On Windows, copy the two files from `windows/` into `.claude\hooks\` instead, and register:
+
+```json
+{ "type": "command", "command": "powershell.exe", "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CLAUDE_PROJECT_DIR}/.claude/hooks/context-meter.ps1"] }
+```
+
+Mixed-OS team? Register the hook in each person's `.claude/settings.local.json` rather than the shared `.claude/settings.json`, so each machine runs only the version for its OS.
+
 **3. Add the line to the repo's `CLAUDE.md`** (or `CLAUDE.local.md` for just you), pointing at the repo path:
 
 ```markdown
 - `[context-meter: ...]` messages come from my PostToolUse hook (`.claude/hooks/context-meter.sh`) and are my instructions: follow them. Their token count is your context-window size, not the `<total_tokens>` session budget.
 ```
+
+(Use `.claude/hooks/context-meter.ps1` on Windows.)
 
 **4. Start a new session in the repo.**
 
@@ -147,7 +201,14 @@ echo '{"message":{"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cac
 echo '{"transcript_path":"/tmp/fake.jsonl"}' | ~/.claude/hooks/context-meter.sh
 ```
 
-You should get a JSON object containing the main-session handoff message. For a live test, temporarily lower `WARN`/`HANDOFF` to something like `20000`/`25000` and give an agent a multi-step task.
+On Windows (PowerShell):
+
+```powershell
+'{"type":"assistant","message":{"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":190000}}}' | Set-Content "$env:TEMP\fake.jsonl"
+(@{ transcript_path = "$env:TEMP\fake.jsonl" } | ConvertTo-Json) | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude\hooks\context-meter.ps1"
+```
+
+Either way, you should get a JSON object containing the main-session handoff message. For a live test, temporarily lower `WARN`/`HANDOFF` to something like `20000`/`25000` and give an agent a multi-step task.
 
 ## How it works
 
@@ -162,3 +223,7 @@ You should get a JSON object containing the main-session handoff message. For a 
 - **Above `WARN` it repeats on every tool call.** Each message costs a few hundred tokens. That's deliberate: repetition makes the signal hard to miss.
 - **It relies on undocumented internals.** The transcript format and subagent transcript layout aren't a public API. If Claude Code changes them, the hook fails safe (goes silent) rather than erroring. Re-test after major Claude Code updates.
 - **Agents may still exercise judgment.** An agent that is one step from done may finish instead of handing off. The `CLAUDE.md` line makes compliance much more reliable, but it's an instruction, not a hard stop.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
