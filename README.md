@@ -18,6 +18,7 @@ It works inside **subagents** too: each subagent is measured against its own tra
 | --- | --- | --- |
 | macOS, Linux | `context-meter.sh` + `context-meter.conf` | `bash` (macOS's stock 3.2 is fine) and `jq` |
 | Windows | `windows/context-meter.ps1` + `windows/context-meter.config.ps1` | PowerShell (built-in Windows PowerShell 5.1, or 7+). No `jq`. |
+| Claude Code on the web | `context-meter.sh` + `context-meter.conf`, committed to your repo | Nothing extra: the cloud VM is Linux with `bash` and `jq` preinstalled. See [Install for Claude Code on the web](#install-for-claude-code-on-the-web). |
 
 Both versions behave the same and use the same settings and placeholders; only the config file syntax differs. The bash version has been tested on macOS (bash 3.2) and Linux (Alpine/BusyBox), and the PowerShell version on PowerShell 7.6.
 
@@ -191,6 +192,66 @@ Mixed-OS team? Register the hook in each person's `.claude/settings.local.json` 
 **4. Start a new session in the repo.**
 
 Each repo gets its own `context-meter.conf`, so thresholds and messages can differ per project.
+
+## Install for Claude Code on the web
+
+Claude Code on the web ([claude.ai/code](https://claude.ai/code), plus cloud sessions started from the desktop or mobile app or with `claude --cloud`) runs each session in a fresh Linux VM with a clone of your GitHub repo. Nothing from your own machine comes with it: `~/.claude/settings.json`, its hooks, and `~/.claude/CLAUDE.md` are all ignored in the cloud. Only what's committed to the repo applies.
+
+So the web install is the [single-repo install](#alternative-install-for-a-single-repo), committed and pushed. The VM already has `bash` and `jq`, so use the bash version, even if you're setting it up from Windows.
+
+Repeat these steps for each repo you use on the web.
+
+**1. Copy the files into the repo:**
+
+```sh
+cd your-repo
+mkdir -p .claude/hooks
+cp /path/to/remove-claude-blinds/context-meter.sh /path/to/remove-claude-blinds/context-meter.conf .claude/hooks/
+```
+
+On Windows, copy the same two files from the repo root, not from `windows/`, because the cloud runs Linux.
+
+**2. Register the hook in `.claude/settings.json`.** It has to be this file: `.claude/settings.local.json` isn't committed, so the cloud clone never sees it.
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/context-meter.sh\"" }] }
+    ]
+  }
+}
+```
+
+Calling the script through `bash` means it still runs if the file lost its executable bit, which happens when it's committed from Windows.
+
+**3. Add the line to the repo's `CLAUDE.md`** (in the repo root; create it if needed). `CLAUDE.local.md` won't work here either, for the same reason as step 2.
+
+```markdown
+- `[context-meter: ...]` messages come from my PostToolUse hook (`.claude/hooks/context-meter.sh`) and are my instructions: follow them. Their token count is your context-window size, not the `<total_tokens>` session budget.
+```
+
+**4. Commit and push** to the branch your cloud sessions start from (usually the default branch):
+
+```sh
+git add .claude/hooks .claude/settings.json CLAUDE.md
+git commit -m "Add context-meter hook"
+git push
+```
+
+**5. Start a new session** on that repo at [claude.ai/code](https://claude.ai/code). To check it's working, ask Claude to run step 1 of [Testing it](#testing-it) with `.claude/hooks/context-meter.sh` as the script path. It should print the handoff message.
+
+### Things to know on the web
+
+- **One repo per session.** Hooks from a repo's `.claude/settings.json` load in cloud sessions that have a single repository.
+- **The committed hook also runs locally.** Anyone who opens this repo on their own machine gets the hook too. If you also have the [global install](#install-on-macos--linux-global-all-projects), every message arrives twice. To run the repo copy only in the cloud, use this command in step 2 instead. Cloud VMs set `CLAUDE_CODE_REMOTE=true`, so on your machine it exits immediately without doing anything:
+
+  ```json
+  "command": "[ \"$CLAUDE_CODE_REMOTE\" != true ] || bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/context-meter.sh\""
+  ```
+
+  Both commands use bash syntax, so teammates on Windows need Git Bash installed for the committed hook to run locally.
+- **Cloud sessions compact earlier.** They auto-compact partway through the context window rather than when it's full, so a session may compact before reaching `HANDOFF`, and the handoff never fires. Run `/context` in a cloud session to see where you stand, then either lower `WARN`/`HANDOFF` in the repo's `context-meter.conf` or raise the compaction window by setting the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment variable in your [cloud environment settings](https://code.claude.com/docs/en/cloud-environments).
 
 ## Testing it
 
