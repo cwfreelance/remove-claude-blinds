@@ -12,6 +12,8 @@ Claude Code shows context usage to *you* (`/context`, the status line), but the 
 
 It works inside **subagents** too: each subagent is measured against its own transcript, not the parent's. That covers the case where a long-running subagent (e.g. a fixer stuck in a review loop) fills up where you can't see it.
 
+[Agent teams](https://code.claude.com/docs/en/agent-teams) teammates are handled the same way: their hook input carries an `agent_id` and their transcripts live alongside subagents', so each teammate is measured on its own context and gets the subagent handoff message. Tested live with an in-process team and lowered thresholds: the teammate wrote a handoff and reported back, and the lead spawned a fresh teammate that picked up where it left off.
+
 ## Platforms
 
 | Platform | Files | Requires |
