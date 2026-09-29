@@ -24,6 +24,8 @@ It works inside **subagents** too: each subagent is measured against its own tra
 
 Both versions behave the same and use the same settings and placeholders; only the config file syntax differs. The bash version has been tested on macOS (bash 3.2) and Linux (Alpine/BusyBox), and the PowerShell version on PowerShell 7.6.
 
+The main session's `terminal` handoff (see [Main session](#main-session)) opens a Terminal.app window on macOS and a PowerShell window on Windows. Linux has no equivalent, so there it falls back to `clear`. On the web, the main session isn't measured at all.
+
 ## Install on macOS / Linux (global, all projects)
 
 **1. Copy the script and config into `~/.claude/hooks/`:**
@@ -118,13 +120,37 @@ HANDOFF=180000  # tell the agent to hand off
 
 To skip the warning tier, set `WARN` equal to `HANDOFF`. Pick numbers that suit your model: on a 1M-context model these are quality cutoffs, not hard limits.
 
+### Main session
+
+```sh
+MAIN_SESSION=on        # off: measure only subagents and agent-team teammates
+HANDOFF_MODE=terminal  # or clear
+```
+
+With `MAIN_SESSION=off`, the main session is never measured, and `HANDOFF_MODE` and `HANDOFF_MSG_MAIN` go unused. That suits you if you'd rather let the main session auto-compact (see [How is this different from auto-compact?](#how-is-this-different-from-auto-compact)).
+
+When the main session reaches `HANDOFF`, it writes a handoff file and runs `context-meter.sh handoff <file> <project-dir>`. `HANDOFF_MODE` decides what that does:
+
+| `HANDOFF_MODE` | What happens | Where |
+| --- | --- | --- |
+| `terminal` | A new terminal window opens in the project directory, running a fresh `claude` session whose first prompt tells it to read the handoff. It starts working without you pressing anything, and you can talk to it as normal. Close the old window when you're ready. | macOS (Terminal.app), Windows (PowerShell). Falls back to `clear` on Linux. |
+| `clear` | The handoff is copied to the clipboard, prefixed with "Continue from this handoff:". Run `/clear` in the same window and paste. | Everywhere with a clipboard tool: `pbcopy`, `wl-copy` or `xclip` (Linux), `Set-Clipboard` (Windows). |
+
+Either way, it's a genuinely new session with its own transcript, so the meter starts measuring it from scratch. Notes on `terminal`:
+
+- The new session starts with `--add-dir <handoff folder>`, so it can read the handoff without a permission prompt. It runs in the project directory you've already trusted, so there's no trust prompt either.
+- It uses your default model and permission mode, not whatever the old session had switched to.
+- On macOS it always opens Terminal.app, even if you normally use iTerm or another terminal.
+
+Why not have the main agent spawn a subagent to take over? A background subagent drops out of the subagent panel as soon as it finishes, so you can't talk to it. You'd have to relay every message through the full main session.
+
 ### Messages
 
 | Variable | Sent when |
 | --- | --- |
 | `PREFIX` | Prepended to every message. Says where the message comes from and explains the `<total_tokens>` difference. |
 | `WARN_MSG` | Context is between `WARN` and `HANDOFF` |
-| `HANDOFF_MSG_MAIN` | The main session is at or above `HANDOFF` |
+| `HANDOFF_MSG_MAIN` | The main session is at or above `HANDOFF` (only with `MAIN_SESSION=on`) |
 | `HANDOFF_MSG_SUBAGENT` | A subagent is at or above `HANDOFF` |
 
 Placeholders filled in at send time:
@@ -135,6 +161,8 @@ Placeholders filled in at send time:
 | `{warn}` | `150k` |
 | `{handoff}` | `180k` |
 | `{agent_type}` | `general-purpose`, `fixer`, … (subagents only) |
+| `{script}` | the script's own path, for the handoff command |
+| `{project_dir}` | the session's project directory, where the next session starts |
 
 Because the config is a script, you can build messages out of shared pieces. The defaults do this with `$HANDOFF_CONTENTS` (what the handoff file should cover) and `$NO_GIT`. Use double quotes, and escape any literal `$` (`\$` in bash, `` `$ `` in PowerShell).
 
@@ -142,7 +170,7 @@ Because the config is a script, you can build messages out of shared pieces. The
 
 The shipped messages match a workflow where git/GitHub actions stay with a human:
 
-- **Main session at the limit:** finish the current step, write a throwaway handoff file in the scratchpad, spawn a fresh subagent (not a fork, because a fork inherits the full context) pointed at it, then stop and leave the subagent open so the user can talk to it directly.
+- **Main session at the limit:** finish the current step, write a throwaway handoff file in the scratchpad, run the handoff command to start the next session (a new terminal window, or `/clear` and paste, per `HANDOFF_MODE`), tell you what happened, then stop.
 - **Subagent at the limit:** subagents can't spawn subagents, so it finishes the current step, writes the handoff, and stops. Its final report starts with `CONTEXT LIMIT: handoff at <path>` and tells the parent to spawn a fresh agent of the same type rather than resume it.
 - **Both:** no commits, pushes, or PR/issue changes during a handoff. The git state is recorded in the handoff instead.
 
@@ -241,10 +269,11 @@ git commit -m "Add context-meter hook"
 git push
 ```
 
-**5. Start a new session** on that repo at [claude.ai/code](https://claude.ai/code). To check it's working, ask Claude to run step 1 of [Testing it](#testing-it) with `.claude/hooks/context-meter.sh` as the script path. It should print the handoff message.
+**5. Start a new session** on that repo at [claude.ai/code](https://claude.ai/code). To check it's working, ask Claude to run step 2 of [Testing it](#testing-it) with `.claude/hooks/context-meter.sh` as the script path. It should print the subagent handoff message.
 
 ### Things to know on the web
 
+- **Only subagents and teammates are measured.** Cloud VMs set `CLAUDE_CODE_REMOTE=true`, and when the script sees it, it skips the main session. Neither handoff mode can reach you from the cloud: there's no local terminal to open and no clipboard to copy to. `MAIN_SESSION` and `HANDOFF_MODE` are ignored there, and the main session relies on the cloud's own auto-compaction.
 - **One repo per session.** Hooks from a repo's `.claude/settings.json` load in cloud sessions that have a single repository.
 - **The committed hook also runs locally.** Anyone who opens this repo on their own machine gets the hook too. If you also have the [global install](#install-on-macos--linux-global-all-projects), every message arrives twice. To run the repo copy only in the cloud, use this command in step 2 instead. Cloud VMs set `CLAUDE_CODE_REMOTE=true`, so on your machine it exits immediately without doing anything:
 
@@ -253,7 +282,7 @@ git push
   ```
 
   Both commands use bash syntax, so teammates on Windows need Git Bash installed for the committed hook to run locally.
-- **Cloud sessions compact earlier.** They auto-compact partway through the context window rather than when it's full, so a session may compact before reaching `HANDOFF`, and the handoff never fires. Run `/context` in a cloud session to see where you stand, then either lower `WARN`/`HANDOFF` in the repo's `context-meter.conf` or raise the compaction window by setting the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment variable in your [cloud environment settings](https://code.claude.com/docs/en/cloud-environments).
+- **Cloud sessions compact earlier.** They auto-compact partway through the context window rather than when it's full, and subagents compact the same way, so a subagent may compact before reaching `HANDOFF`, and the handoff never fires. Run `/context` in a cloud session to see where you stand, then either lower `WARN`/`HANDOFF` in the repo's `context-meter.conf` or raise the compaction window by setting the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment variable in your [cloud environment settings](https://code.claude.com/docs/en/cloud-environments).
 
 ## Testing it
 
@@ -296,7 +325,7 @@ New-Item -ItemType Directory -Force "$d\session\subagents" | Out-Null
 (@{ transcript_path = "$d\session.jsonl" } | ConvertTo-Json) | powershell.exe -NoProfile -ExecutionPolicy Bypass -File $hook
 ```
 
-Expected: a JSON object whose `additionalContext` starts with `[context-meter: ...]` and contains `CONTEXT LIMIT: you are at 190k tokens`.
+Expected: a JSON object whose `additionalContext` starts with `[context-meter: ...]` and contains `CONTEXT LIMIT: you are at 190k tokens`. With `MAIN_SESSION=off` it prints nothing.
 
 ### 2. Subagent
 
@@ -342,15 +371,47 @@ $u.input_tokens + $u.cache_creation_input_tokens + $u.cache_read_input_tokens
 
 If you run this from inside a Claude Code session, the most recent transcript is that session's own, so the number should roughly match `/context`.
 
-### 4. Live
+### 4. The handoff command
 
-For an end-to-end check, temporarily lower `WARN`/`HANDOFF` to something like `20000`/`25000`. A fresh session already uses about 20k tokens for the system prompt and tools, so the handoff triggers after a few tool calls. Give an agent (or a subagent) a multi-step task and confirm it stops and writes a handoff. Put the thresholds back afterward.
+This runs what the main agent runs at the limit, with a harmless handoff. Run it from a project folder you've already opened Claude Code in, since the new session starts there.
+
+macOS / Linux:
+
+```sh
+echo 'Test handoff from context-meter. Reply with exactly HANDOFF-OK and nothing else.' > /tmp/cm-test/handoff.md
+~/.claude/hooks/context-meter.sh handoff /tmp/cm-test/handoff.md "$PWD"
+```
+
+Windows (PowerShell, continuing from step 1):
+
+```powershell
+'Test handoff from context-meter. Reply with exactly HANDOFF-OK and nothing else.' | Set-Content "$d\handoff.md"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $hook handoff "$d\handoff.md" "$PWD"
+```
+
+Expected with `terminal`: a new window opens, `claude` starts, reads the handoff, and replies `HANDOFF-OK` on its own. With `clear`: the handoff is on your clipboard, ready to paste after `/clear`.
+
+### 5. Live
+
+For an end-to-end check, temporarily lower `WARN`/`HANDOFF` to something like `40000`/`45000`. A fresh session already uses 20–30k tokens for the system prompt and tools (`/context` shows how much), so the handoff triggers after a few tool calls. Give an agent (or a subagent) a multi-step task and confirm it stops and writes a handoff, and for the main session, that the next session starts. Put the thresholds back afterward.
+
+## How is this different from auto-compact?
+
+Claude Code already has auto-compact: when a conversation nears its auto-compact window, Claude Code summarizes the older history and carries on in the same session. For the main session the two overlap: both give the agent a condensed version of where things stand and a mostly empty context. The differences:
+
+- **When it fires.** On a model with a 1M context window, auto-compact waits until about 967k tokens by default, long after recall has started to slip for many people. You can move it earlier with the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` environment variable. context-meter fires wherever you set `HANDOFF`.
+- **At a sensible stopping point.** Auto-compact fires the moment the threshold is crossed, even halfway through a change. context-meter warns first (don't start another review round), then lets the agent finish the step it's in before handing off.
+- **Who writes the summary, and where it lives.** A compaction summary comes from a separate summarization pass and exists only inside the conversation. You can steer it with `/compact <focus>` or a `# Compact instructions` section in `CLAUDE.md`. A handoff is written by the agent that did the work, to a checklist you control (task, done, left, git state, open findings, gotchas). It's a file you can read, edit, or hand to a different agent.
+- **Subagents don't compact silently.** This is the biggest one. Subagents auto-compact too, invisibly. A subagent stuck in a loop, like a fixer going round after round of review, just keeps going on summaries, and the parent never finds out. context-meter makes the subagent stop and report `CONTEXT LIMIT: handoff at <path>`, so the parent sees it and decides whether to spawn a fresh agent or step in.
+
+**Using both.** If you'd rather the main session just keep going, set `MAIN_SESSION=off`. Then move auto-compact earlier by setting `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (for example `"250000"`) in the `env` block of `settings.json`, and add a `# Compact instructions` section to `CLAUDE.md` listing what the summary should keep. context-meter then watches only subagents and teammates. The compact window applies to subagents too, so keep it comfortably above `HANDOFF`. If it's lower, subagents compact before the handoff ever fires.
 
 ## How it works
 
 - Every assistant turn in the session transcript (`~/.claude/projects/<project>/<session>.jsonl`) records API usage. The context size is `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` of the latest turn.
-- Hooks that fire inside a subagent receive `agent_id` and `agent_type`, but `transcript_path` still points at the parent session. The script reads the subagent's own transcript at `<session>/subagents/agent-<agent_id>.jsonl` instead.
+- Hooks that fire inside a subagent receive `agent_id` and `agent_type`, but `transcript_path` still points at the parent session. The script reads the subagent's own transcript at `<session>/subagents/agent-<agent_id>.jsonl` instead. The main session's hook input has no `agent_id` (even under `claude --agent`), which is how `MAIN_SESSION=off` tells them apart.
 - The message is returned as `hookSpecificOutput.additionalContext`, which Claude Code adds to the agent's context after the tool result.
+- `context-meter.sh handoff <file> <project-dir>` is the same script, run by the agent rather than by Claude Code. In `terminal` mode it asks Terminal.app, through `osascript`, to open a window running `claude "Read the handoff at <file> and continue from it." --add-dir <handoff folder>`. On Windows it uses `Start-Process`. It doesn't just run `claude` itself, because a `claude` started from inside another session inherits a marker that turns off transcript saving, which would leave the meter blind in the new session. Terminal.app starts the window with a clean environment. On Windows, the script removes the parent session's `CLAUDE*` variables before launching, keeping any you've set in your user or system environment.
 
 ## Limitations
 

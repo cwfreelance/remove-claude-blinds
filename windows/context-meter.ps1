@@ -6,9 +6,40 @@ $conf = Join-Path $PSScriptRoot 'context-meter.config.ps1'
 if (-not (Test-Path -LiteralPath $conf)) { exit 0 }
 . $conf
 
+# `context-meter.ps1 handoff <file> <project-dir>` is run by the main agent (not as a hook) once it has
+# written its handoff. It starts the next session per $HANDOFF_MODE and prints what to tell the user.
+if ($args[0] -eq 'handoff') {
+    $f = $args[1]
+    $dir = if ($args[2]) { $args[2] } else { $PWD.Path }
+    if ($HANDOFF_MODE -eq 'terminal') {
+        # A new PowerShell window running a fresh session. It inherits this environment, so drop the parent
+        # session's CLAUDE* markers first (CLAUDE_CODE_CHILD_SESSION turns off transcript saving, and with it
+        # this meter), keeping any you set yourself. --add-dir lets it read the handoff without a prompt; it
+        # goes after the prompt because it takes several directories and would swallow the prompt.
+        Get-ChildItem Env: | Where-Object { $_.Name -like 'CLAUDE*' -and -not [Environment]::GetEnvironmentVariable($_.Name, 'User') -and -not [Environment]::GetEnvironmentVariable($_.Name, 'Machine') } | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
+        $prompt = "Read the handoff at $f and continue from it." -replace "'", "''"
+        $addDir = (Split-Path -Parent $f) -replace "'", "''"
+        try {
+            Start-Process (Get-Process -Id $PID).Path -WorkingDirectory $dir -ErrorAction Stop -ArgumentList '-NoExit', '-ExecutionPolicy', 'Bypass', '-Command', "claude '$prompt' --add-dir '$addDir'"
+            'Opened a new PowerShell window running a fresh Claude Code session that starts from the handoff. Tell the user to continue there and close this one.'
+            exit 0
+        } catch {}
+    }
+    # clear, or the new window failed: the user runs /clear and pastes.
+    try {
+        "Continue from this handoff:`n`n" + (Get-Content -Raw -LiteralPath $f) | Set-Clipboard -ErrorAction Stop
+        'Copied the handoff to the clipboard. Tell the user to run /clear, then paste.'
+    } catch {
+        "No clipboard available. Tell the user to run /clear, then paste the contents of $f."
+    }
+    exit 0
+}
+
 $in = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $t = $in.transcript_path
 if (-not $t) { exit 0 }
+# Only subagents and teammates have an agent_id. The main session is measured only with $MAIN_SESSION = 'on'.
+if (-not $in.agent_id -and $MAIN_SESSION -ne 'on') { exit 0 }
 $agentType = if ($in.agent_type) { $in.agent_type } else { 'subagent' }
 # Subagent hooks receive the parent's transcript_path; the subagent's own transcript
 # lives at <session>/subagents/agent-<id>.jsonl
@@ -29,5 +60,7 @@ $msg = $msg.Replace('{tokens}', "$([math]::Floor($n / 1000))k")
 $msg = $msg.Replace('{warn}', "$([math]::Floor($WARN / 1000))k")
 $msg = $msg.Replace('{handoff}', "$([math]::Floor($HANDOFF / 1000))k")
 $msg = $msg.Replace('{agent_type}', $agentType)
+$msg = $msg.Replace('{script}', $PSCommandPath)
+$msg = $msg.Replace('{project_dir}', $(if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { "$($in.cwd)" }))
 
 @{ hookSpecificOutput = @{ hookEventName = 'PostToolUse'; additionalContext = $msg } } | ConvertTo-Json -Compress
